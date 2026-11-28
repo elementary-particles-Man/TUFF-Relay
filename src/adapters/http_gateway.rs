@@ -1,5 +1,5 @@
 use crate::adapters::supervisor::{
-    AckReportRequest, FinishRequest, SubmitTaskRequest, SupervisorAdapter,
+    AckReportRequest, ControlRequest, FinishRequest, SubmitTaskRequest, SupervisorAdapter,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -242,6 +242,10 @@ fn handle_http_connection(
                 serde_json::json!({ "error": e.to_string() }).to_string(),
             ),
         },
+        ("POST", "/pause") => control_http(body_str, |req| adapter.pause(req)),
+        ("POST", "/resume") => control_http(body_str, |req| adapter.resume(req)),
+        ("POST", "/interrupt") => control_http(body_str, |req| adapter.interrupt(req)),
+        ("POST", "/reconcile") => control_http(body_str, |req| adapter.reconcile(req)),
         ("POST", "/finish") => match serde_json::from_str::<FinishRequest>(body_str) {
             Ok(req) => match adapter.finish(req) {
                 Ok(resp) => ("200 OK", serde_json::to_string(&resp).unwrap_or_default()),
@@ -270,6 +274,25 @@ fn handle_http_connection(
     let _ = writer.write_all(full_resp.as_bytes());
     let _ = writer.flush();
     Ok(())
+}
+
+fn control_http<F>(body: &str, action: F) -> (&'static str, String)
+where
+    F: FnOnce(ControlRequest) -> Result<crate::adapters::supervisor::ControlResponse, String>,
+{
+    match serde_json::from_str::<ControlRequest>(body) {
+        Ok(req) => match action(req) {
+            Ok(resp) => ("200 OK", serde_json::to_string(&resp).unwrap_or_default()),
+            Err(error) => (
+                "400 Bad Request",
+                serde_json::json!({ "error": error }).to_string(),
+            ),
+        },
+        Err(error) => (
+            "400 Bad Request",
+            serde_json::json!({ "error": error.to_string() }).to_string(),
+        ),
+    }
 }
 
 fn parse_query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {

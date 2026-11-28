@@ -1,7 +1,8 @@
-use crate::adapters::codex::CodexAppServerClient;
+use crate::adapters::codex::{CodexAppServerClient, CodexInterruptHandle};
 use crate::core::envelope::Envelope;
 use crate::core::reducer::{Event, ReduceError, SideEffect};
 use crate::core::state::LaneState;
+use crate::core::state::{ReportLifecycle, WorkerState};
 use crate::core::types::{LaneId, MessageId, RunId, TaskId, TurnId};
 use crate::FileJournal;
 use std::collections::HashMap;
@@ -10,6 +11,50 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+
+#[derive(Clone, Default)]
+pub struct LaneDriverControl {
+    inner: Arc<Mutex<LaneDriverControlState>>,
+}
+
+#[derive(Default)]
+struct LaneDriverControlState {
+    interrupt_handle: Option<CodexInterruptHandle>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+impl LaneDriverControl {
+    fn attach(&self, handle: CodexInterruptHandle, thread_id: Option<String>) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.interrupt_handle = Some(handle);
+            state.thread_id = thread_id;
+        }
+    }
+
+    fn set_active_turn(&self, turn_id: Option<String>) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.turn_id = turn_id;
+        }
+    }
+
+    pub fn interrupt(&self) -> Result<String, String> {
+        let state = self.inner.lock().map_err(|e| e.to_string())?;
+        let handle = state
+            .interrupt_handle
+            .as_ref()
+            .ok_or("LaneDriver interrupt handle is not attached")?;
+        let thread_id = state
+            .thread_id
+            .as_deref()
+            .ok_or("Worker thread ID is not configured")?;
+        let turn_id = state.turn_id.as_deref().ok_or("No active worker turn")?;
+        handle
+            .interrupt(thread_id, turn_id)
+            .map_err(|e| e.to_string())?;
+        Ok(turn_id.to_string())
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaneConfig {
@@ -65,6 +110,52 @@ impl RelayRuntime {
         self.states.get(lane_id)
     }
 
+    pub fn heartbeat(&mut self, lane_id: &LaneId) -> Result<(), String> {
+        let state = self.states.get_mut(lane_id).ok_or("Lane not found")?;
+        state.worker_liveness.last_heartbeat_at = Some(now_ms());
+        Ok(())
+    }
+
+    pub fn mark_report_delivery_pending(&mut self, lane_id: &LaneId) -> Result<(), String> {
+        let state = self.states.get_mut(lane_id).ok_or("Lane not found")?;
+        state.report_lifecycle = ReportLifecycle::DeliveryPending;
+        state.wakeup.send_attempted_at = Some(now_ms());
+        state.wakeup.send_result = Some("DELIVERY_PENDING".to_string());
+        Ok(())
+    }
+
+    pub fn mark_report_delivery_result(
+        &mut self,
+        lane_id: &LaneId,
+        succeeded: bool,
+        detail: impl Into<String>,
+    ) -> Result<(), String> {
+        let state = self.states.get_mut(lane_id).ok_or("Lane not found")?;
+        state.report_lifecycle = if succeeded {
+            ReportLifecycle::Ready
+        } else {
+            ReportLifecycle::DeliveryFailed
+        };
+        if succeeded {
+            state.wakeup.send_succeeded_at = Some(now_ms());
+        }
+        state.wakeup.send_result = Some(detail.into());
+        Ok(())
+    }
+
+    pub fn mark_waiting_external(
+        &mut self,
+        lane_id: &LaneId,
+        reason: impl Into<String>,
+    ) -> Result<(), String> {
+        let state = self.states.get_mut(lane_id).ok_or("Lane not found")?;
+        state.worker_liveness.state = WorkerState::WaitingExternal;
+        state.worker_liveness.blocked_reason = Some(reason.into());
+        state.worker_liveness.next_expected_action = "EXTERNAL_EVENT".to_string();
+        state.worker_liveness.last_heartbeat_at = Some(now_ms());
+        Ok(())
+    }
+
     pub fn all_states(&self) -> &HashMap<LaneId, LaneState> {
         &self.states
     }
@@ -77,6 +168,17 @@ impl RelayRuntime {
         &mut self,
         event: Event,
     ) -> Result<(LaneState, Vec<SideEffect>), ReduceError> {
+        let observed_at = now_ms();
+        let received = matches!(
+            &event,
+            Event::TaskReceived(_) | Event::DecisionResponseAccepted { .. }
+        );
+        let processing_started = matches!(&event, Event::WorkerTurnBound { .. });
+        let processing_completed = matches!(
+            &event,
+            Event::WorkerTurnCompleted { .. } | Event::WorkerTurnFailed { .. }
+        );
+        let acknowledged = matches!(&event, Event::SupervisorAckReceived { .. });
         let lane_id = match &event {
             Event::StartRun { lane_id, .. } => lane_id.clone(),
             Event::TaskReceived(env) => env.lane_id.clone(),
@@ -96,7 +198,20 @@ impl RelayRuntime {
 
         let current_state = self.states.get(&lane_id).ok_or(ReduceError::LaneMismatch)?;
 
-        let (new_state, effects) = crate::core::reducer::reduce(current_state, event)?;
+        let (mut new_state, effects) = crate::core::reducer::reduce(current_state, event)?;
+        new_state.worker_liveness.last_heartbeat_at = Some(observed_at);
+        if received {
+            new_state.wakeup.received_at = Some(observed_at);
+        }
+        if processing_started {
+            new_state.wakeup.processing_started_at = Some(observed_at);
+        }
+        if processing_completed {
+            new_state.wakeup.processing_completed_at = Some(observed_at);
+        }
+        if acknowledged {
+            new_state.wakeup.acknowledged_at = Some(observed_at);
+        }
 
         // Persist events before executing external effects
         if let Some(journal) = self.journals.get_mut(&lane_id) {
@@ -115,6 +230,13 @@ impl RelayRuntime {
         self.states.insert(lane_id, new_state.clone());
         Ok((new_state, effects))
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Inspects raw worker report text for explicit decision marker per TR-DD-001 §3.3.
@@ -355,6 +477,7 @@ impl LaneDriver {
         runtime_arc: Arc<Mutex<RelayRuntime>>,
         lane_id: LaneId,
         codex_bin_path: String,
+        control: LaneDriverControl,
     ) -> std::io::Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
@@ -392,10 +515,13 @@ impl LaneDriver {
             })?;
         }
 
+        control.attach(codex_client.interrupt_handle(), target_thread_id.clone());
+
         let handle = thread::spawn(move || {
             while running_clone.load(Ordering::Relaxed) {
                 let dispatch_setup = {
                     let mut rt = runtime_arc.lock().unwrap();
+                    let _ = rt.heartbeat(&lane_id);
                     let should_dispatch = if let Some(st) = rt.get_state(&lane_id) {
                         st.phase == crate::core::state::Phase::Accepted && !st.pause_requested
                     } else {
@@ -412,8 +538,10 @@ impl LaneDriver {
                 if let Some((turn_id, turn_id_str, task_env, active_task, epoch, run_id)) =
                     dispatch_setup
                 {
+                    control.set_active_turn(Some(turn_id_str.clone()));
                     // Wait for turn completion WITHOUT holding runtime_arc lock!
                     let result = codex_client.wait_turn_completion(&turn_id_str);
+                    control.set_active_turn(None);
 
                     let mut rt = runtime_arc.lock().unwrap();
                     match result {

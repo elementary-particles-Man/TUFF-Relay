@@ -4,6 +4,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,10 +111,39 @@ struct JsonRpcErrorObj {
 
 pub struct CodexAppServerClient {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Arc<Mutex<ChildStdin>>,
     reader: BufReader<ChildStdout>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     buffered_server_requests: Vec<ServerRequestMessage>,
+}
+
+#[derive(Clone)]
+pub struct CodexInterruptHandle {
+    stdin: Arc<Mutex<ChildStdin>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl CodexInterruptHandle {
+    pub fn interrupt(&self, thread_id: &str, turn_id: &str) -> Result<(), CodexAdapterError> {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: self.next_id.fetch_add(1, Ordering::SeqCst),
+            method: "turn/interrupt".to_string(),
+            params: serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id
+            }),
+        };
+        let line = serde_json::to_string(&req)?;
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| std::io::Error::other("Codex stdin lock poisoned"))?;
+        stdin.write_all(line.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+        Ok(())
+    }
 }
 
 impl CodexAppServerClient {
@@ -136,15 +166,22 @@ impl CodexAppServerClient {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Arc::new(Mutex::new(stdin)),
             reader,
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
             buffered_server_requests: Vec::new(),
         })
     }
 
     fn next_request_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn interrupt_handle(&self) -> CodexInterruptHandle {
+        CodexInterruptHandle {
+            stdin: self.stdin.clone(),
+            next_id: self.next_id.clone(),
+        }
     }
 
     pub fn pop_server_request(&mut self) -> Option<ServerRequestMessage> {
@@ -164,9 +201,15 @@ impl CodexAppServerClient {
             params,
         };
         let line = serde_json::to_string(&req)?;
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
+        {
+            let mut stdin = self
+                .stdin
+                .lock()
+                .map_err(|_| std::io::Error::other("Codex stdin lock poisoned"))?;
+            stdin.write_all(line.as_bytes())?;
+            stdin.write_all(b"\n")?;
+            stdin.flush()?;
+        }
 
         // Wait for response matching req_id
         let mut resp_line = String::new();
@@ -228,9 +271,13 @@ impl CodexAppServerClient {
             params,
         };
         let line = serde_json::to_string(&notif)?;
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| std::io::Error::other("Codex stdin lock poisoned"))?;
+        stdin.write_all(line.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 use super::envelope::{Envelope, MessageKind};
-use super::state::{LaneState, Phase};
+use super::state::{LaneState, Phase, ReportLifecycle, WakeupObservation, WorkerState};
 use super::types::{LaneId, MessageId, RunId, TaskId, TurnId, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 
@@ -190,6 +190,13 @@ pub fn reduce(
             next.active_task_envelope = None;
             next.worker_turn = None;
             next.pending_report = None;
+            next.worker_liveness.state = WorkerState::Waiting;
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.current_task_id = None;
+            next.worker_liveness.blocked_reason = None;
+            next.worker_liveness.next_expected_action = "SUBMIT_TASK".to_string();
+            next.report_lifecycle = ReportLifecycle::NotCreated;
+            next.wakeup = WakeupObservation::default();
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {
@@ -262,6 +269,16 @@ pub fn reduce(
             next.phase = Phase::Accepted;
             next.active_task = Some(envelope.task_id.clone());
             next.active_task_envelope = Some(envelope.clone());
+            next.worker_liveness.state = WorkerState::Waiting;
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.current_task_id = Some(envelope.task_id.as_str().to_string());
+            next.worker_liveness.blocked_reason = None;
+            next.worker_liveness.next_expected_action = "DISPATCH_WORKER".to_string();
+            next.report_lifecycle = ReportLifecycle::NotCreated;
+            next.wakeup = WakeupObservation {
+                received_at: None,
+                ..WakeupObservation::default()
+            };
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {
@@ -311,6 +328,8 @@ pub fn reduce(
 
             let mut next = state.clone();
             next.phase = Phase::Dispatching;
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.next_expected_action = "WORKER_TURN_START".to_string();
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {
@@ -362,6 +381,13 @@ pub fn reduce(
             let mut next = state.clone();
             next.phase = Phase::Running;
             next.worker_turn = Some(turn_id.clone());
+            next.worker_liveness.state = WorkerState::Running;
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.current_task_id = Some(task_id.as_str().to_string());
+            next.worker_liveness.blocked_reason = None;
+            next.worker_liveness.next_expected_action = "WORKER_COMPLETION".to_string();
+            next.report_lifecycle = ReportLifecycle::Generating;
+            next.wakeup.processing_started_at = None;
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {
@@ -402,6 +428,10 @@ pub fn reduce(
 
             let mut next = state.clone();
             next.phase = Phase::Reconcile;
+            next.worker_liveness.state = WorkerState::Failed;
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.blocked_reason = Some(reason.clone());
+            next.worker_liveness.next_expected_action = "RECONCILE".to_string();
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {
@@ -473,6 +503,17 @@ pub fn reduce(
             next.phase = Phase::ReportReady;
             next.pending_report = Some(report_envelope.clone());
             next.last_report_was_decision_required = is_decision_required;
+            next.worker_liveness.state = if is_decision_required {
+                WorkerState::ApprovalRequired
+            } else {
+                WorkerState::Waiting
+            };
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.blocked_reason =
+                is_decision_required.then_some("SUPERVISOR_APPROVAL_REQUIRED".to_string());
+            next.worker_liveness.next_expected_action = "GET_REPORT_AND_ACK".to_string();
+            next.report_lifecycle = ReportLifecycle::Ready;
+            next.wakeup.processing_completed_at = None;
             next.journal_seq += 1;
 
             let journal_body = if is_decision_required {
@@ -548,6 +589,12 @@ pub fn reduce(
             next.phase = Phase::ReportReady;
             next.pending_report = Some(failure_report_envelope.clone());
             next.last_report_was_decision_required = false;
+            next.worker_liveness.state = WorkerState::Failed;
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.blocked_reason = Some("WORKER_FAILED".to_string());
+            next.worker_liveness.next_expected_action = "GET_FAILURE_REPORT_AND_ACK".to_string();
+            next.report_lifecycle = ReportLifecycle::Ready;
+            next.wakeup.processing_completed_at = None;
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {
@@ -595,6 +642,10 @@ pub fn reduce(
 
             let mut next = state.clone();
             next.phase = Phase::Reconcile;
+            next.worker_liveness.state = WorkerState::Failed;
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.blocked_reason = Some(reason.clone());
+            next.worker_liveness.next_expected_action = "RECONCILE".to_string();
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {
@@ -650,6 +701,8 @@ pub fn reduce(
             let mut next = state.clone();
             next.last_acked_report = Some(report_id.clone());
             next.pending_report = None;
+            next.report_lifecycle = ReportLifecycle::Acked;
+            next.wakeup.acknowledged_at = None;
 
             // Record completed active task into task_history before clearing
             if let Some(active_task_id) = next.active_task.take() {
@@ -663,11 +716,22 @@ pub fn reduce(
 
             if next.last_report_was_decision_required {
                 next.phase = Phase::WaitDecision;
+                next.worker_liveness.state = WorkerState::ApprovalRequired;
+                next.worker_liveness.blocked_reason =
+                    Some("SUPERVISOR_DECISION_REQUIRED".to_string());
+                next.worker_liveness.next_expected_action = "SUBMIT_DECISION_RESPONSE".to_string();
             } else if next.pause_requested {
                 next.phase = Phase::Stopped;
+                next.worker_liveness.state = WorkerState::Paused;
+                next.worker_liveness.next_expected_action = "RESUME".to_string();
             } else {
                 next.phase = Phase::WaitTask;
+                next.worker_liveness.state = WorkerState::Waiting;
+                next.worker_liveness.current_task_id = None;
+                next.worker_liveness.blocked_reason = None;
+                next.worker_liveness.next_expected_action = "SUBMIT_TASK".to_string();
             }
+            next.worker_liveness.last_heartbeat_at = None;
 
             let journal_event = DurableJournalEvent {
                 seq: next.journal_seq,
@@ -741,6 +805,17 @@ pub fn reduce(
             next.active_task = Some(continuation_task.task_id.clone());
             next.active_task_envelope = Some(continuation_task.clone());
             next.last_report_was_decision_required = false;
+            next.worker_liveness.state = WorkerState::Waiting;
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.current_task_id =
+                Some(continuation_task.task_id.as_str().to_string());
+            next.worker_liveness.blocked_reason = None;
+            next.worker_liveness.next_expected_action = "DISPATCH_WORKER".to_string();
+            next.report_lifecycle = ReportLifecycle::NotCreated;
+            next.wakeup = WakeupObservation {
+                received_at: None,
+                ..WakeupObservation::default()
+            };
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {
@@ -759,6 +834,10 @@ pub fn reduce(
             }
             let mut next = state.clone();
             next.pause_requested = true;
+            next.worker_liveness.state = WorkerState::Paused;
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.blocked_reason = Some("PAUSE_REQUESTED".to_string());
+            next.worker_liveness.next_expected_action = "RESUME_OR_INTERRUPT".to_string();
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {
@@ -779,6 +858,23 @@ pub fn reduce(
             }
             let mut next = state.clone();
             next.pause_requested = false;
+            next.worker_liveness.state = match state.phase {
+                Phase::Running => WorkerState::Running,
+                Phase::WaitDecision => WorkerState::ApprovalRequired,
+                Phase::Reconcile => WorkerState::Failed,
+                Phase::Stopped => WorkerState::Stopped,
+                _ => WorkerState::Waiting,
+            };
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.blocked_reason = None;
+            next.worker_liveness.next_expected_action = match state.phase {
+                Phase::Running => "WORKER_COMPLETION",
+                Phase::WaitDecision => "SUBMIT_DECISION_RESPONSE",
+                Phase::Reconcile => "RECONCILE",
+                Phase::Stopped => "START_RUN",
+                _ => "SUBMIT_TASK",
+            }
+            .to_string();
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {
@@ -810,6 +906,10 @@ pub fn reduce(
             let mut next = state.clone();
             next.phase = Phase::Stopped;
             next.enabled = false;
+            next.worker_liveness.state = WorkerState::Stopped;
+            next.worker_liveness.last_heartbeat_at = None;
+            next.worker_liveness.blocked_reason = Some("RUN_STOPPED".to_string());
+            next.worker_liveness.next_expected_action = "START_RUN".to_string();
             next.journal_seq += 1;
 
             let journal_event = DurableJournalEvent {

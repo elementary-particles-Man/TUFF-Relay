@@ -4,6 +4,16 @@ use serde_json::Value;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 
+fn lane_control_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "lane_id": { "type": "string" }
+        },
+        "required": ["lane_id"]
+    })
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct McpJsonRpcRequest {
     pub jsonrpc: String,
@@ -112,6 +122,26 @@ impl SupervisorMcpServer {
                                 },
                                 "required": ["lane_id", "report_id"]
                             }
+                        },
+                        {
+                            "name": "pause",
+                            "description": "Pause new dispatch and expose PAUSED liveness (Write-capable).",
+                            "inputSchema": lane_control_schema()
+                        },
+                        {
+                            "name": "resume",
+                            "description": "Resume dispatch after a pause (Write-capable).",
+                            "inputSchema": lane_control_schema()
+                        },
+                        {
+                            "name": "interrupt",
+                            "description": "Request turn/interrupt for the active worker turn (Write-capable).",
+                            "inputSchema": lane_control_schema()
+                        },
+                        {
+                            "name": "reconcile",
+                            "description": "Request authoritative reconciliation; returns BLOCKED until a worker probe is available (Write-capable).",
+                            "inputSchema": lane_control_schema()
                         }
                     ]
                 });
@@ -233,6 +263,42 @@ impl SupervisorMcpServer {
                                 lane_id: lane_id.to_string(),
                                 report_id: report_id.to_string(),
                             }) {
+                            Ok(res) => McpJsonRpcResponse {
+                                jsonrpc: "2.0".to_string(),
+                                id: req_id,
+                                result: Some(serde_json::json!({
+                                    "content": [{
+                                        "type": "text",
+                                        "text": serde_json::to_string(&res).unwrap_or_default()
+                                    }]
+                                })),
+                                error: None,
+                            },
+                            Err(e) => McpJsonRpcResponse {
+                                jsonrpc: "2.0".to_string(),
+                                id: req_id,
+                                result: None,
+                                error: Some(McpJsonRpcError {
+                                    code: -32000,
+                                    message: e,
+                                    data: None,
+                                }),
+                            },
+                        }
+                    }
+                    "pause" | "resume" | "interrupt" | "reconcile" => {
+                        let lane_id = args.get("lane_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let req = crate::adapters::supervisor::ControlRequest {
+                            lane_id: lane_id.to_string(),
+                        };
+                        let result = match tool_name {
+                            "pause" => self.adapter.pause(req),
+                            "resume" => self.adapter.resume(req),
+                            "interrupt" => self.adapter.interrupt(req),
+                            "reconcile" => self.adapter.reconcile(req),
+                            _ => unreachable!(),
+                        };
+                        match result {
                             Ok(res) => McpJsonRpcResponse {
                                 jsonrpc: "2.0".to_string(),
                                 id: req_id,

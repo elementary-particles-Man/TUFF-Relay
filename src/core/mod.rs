@@ -9,5 +9,7 @@ pub use journal::{FileJournal, PersistedJournalEntry};
 pub use reducer::{
     reduce, DurableEventBody, DurableJournalEvent, Event, ReconcileOutcome, ReduceError, SideEffect,
 };
-pub use state::{LaneState, Phase};
+pub use state::{
+    LaneState, Phase, ReportLifecycle, WakeupObservation, WorkerLiveness, WorkerState,
+};
 pub use types::{LaneId, MessageId, RunId, TaskId, TurnId, PROTOCOL_VERSION};

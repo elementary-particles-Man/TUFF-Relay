@@ -8,7 +8,7 @@ use tuff_relay::adapters::mcp_server::SupervisorMcpServer;
 use tuff_relay::adapters::supervisor::SupervisorAdapter;
 use tuff_relay::core::*;
 use tuff_relay::ipc::{IpcRequest, IpcResponse, IpcServer};
-use tuff_relay::runtime::LaneDriver;
+use tuff_relay::runtime::{LaneDriver, LaneDriverControl};
 use tuff_relay::{LaneConfig, RelayRuntime};
 
 fn print_usage() {
@@ -158,7 +158,12 @@ fn main() {
             });
 
             let runtime_arc = Arc::new(Mutex::new(runtime));
-            let adapter = Arc::new(SupervisorAdapter::new(runtime_arc.clone(), lane_id.clone()));
+            let driver_control = LaneDriverControl::default();
+            let adapter = Arc::new(SupervisorAdapter::new_with_control(
+                runtime_arc.clone(),
+                lane_id.clone(),
+                driver_control.clone(),
+            ));
 
             // Start HTTP Gateway (fail-closed token)
             let http_gateway =
@@ -302,7 +307,12 @@ fn main() {
             // Start LaneDriver background thread with verified worker binding
             let codex_bin =
                 env::var("CODEX_BIN").unwrap_or_else(|_| "/home/flux/.local/bin/codex".to_string());
-            let _driver = match LaneDriver::spawn(runtime_arc.clone(), lane_id.clone(), codex_bin) {
+            let _driver = match LaneDriver::spawn(
+                runtime_arc.clone(),
+                lane_id.clone(),
+                codex_bin,
+                driver_control,
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!(

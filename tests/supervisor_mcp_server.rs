@@ -62,7 +62,21 @@ fn test_supervisor_mcp_server_protocol() {
         .and_then(|t| t.as_array())
         .cloned()
         .unwrap();
-    assert_eq!(tools.len(), 4);
+    assert_eq!(tools.len(), 8);
+    for required in [
+        "status",
+        "submit",
+        "get_report",
+        "ack",
+        "pause",
+        "resume",
+        "interrupt",
+        "reconcile",
+    ] {
+        assert!(tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(|v| v.as_str()) == Some(required)));
+    }
 
     // 3. Status tool call
     let status_req = McpJsonRpcRequest {
